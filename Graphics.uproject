@@ -1,0 +1,16 @@
+{
+	"FileVersion": 3,
+	"EngineAssociation": "{1C80183B-40B0-9D39-2F4F-AA8E1A686D16}",
+	"Category": "",
+	"Description": "",
+	"Modules": [
+		{
+			"Name": "Graphics",
+			"Type": "Runtime",
+			"LoadingPhase": "Default",
+			"AdditionalDependencies": [
+				"Engine"
+			]
+		}
+	]
+}
