@@ -1,0 +1,60 @@
+#C++与Shader的绑定
+FShader是Shader在C++内的表达,通过IMPLEMENT_MATERIAL_SHADER_TYPE宏来进行FShader子类
+与HLSL代码的绑定.例如在DepthRendering.cpp内的绑定depthRender shader代码
+
+IMPLEMENT_MATERIAL_SHADER_TYPE(,FDepthOnlyPS,TEXT("/Engine/Private/DepthOnlyPixelShader.usf"),TEXT("Main"),SF_Pixel);
+
+此宏绑定FDepthOnlyPS这个FShader子类与DepthOnlyPixelShader.usf的HLSL Code,表明入口函数Main与Shader类型SF_Pixel(SF=Shader Frequency 是Unreal的术语来代表Shader类型,Vertex, Hull, Domain,Geomerty, Pixel,Compute)
+
+注意上面宏忽略第一个参数,因为FDepthOnlyPS不是模板类,在使用模板类的情况下,第一个参数指定一个模板类,此时第二个参数用来声明一个具体的实现(参考BasePassRendering.cpp的IMPLEMENT_BASEPASS_LIGHTMAPPED_SHADER_TYPE)
+
+#GlobalShader
+引擎中从FGlobalShader继承而来的shader代表全局shader,全局shader只有一个实例和一套运行时shader参数。
+在写一个全局Shader时，在继承的子类内需要使用DECLARE_GLOBAL_SHADER宏，此宏内部会展开一些FGlobalShader必备的参数变量
+还需要SHADER_USE_PARAMETER_STRUCT(ShaderClass, ParentShaderClass),此宏会展开一个通用构造函数
+下面是声明此shader内用到的参数,如下使用
+以下定义来自FCopyRectPS,功能是从源拷贝pixel到目标并执行一次格式转换
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )                    //16byte对齐
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, InputTexture)       //定义一个输入Texture参数,占8byte
+		SHADER_PARAMETER_SAMPLER(SamplerState, InputSampler)        //定义一个SamplerState参数,占8byte
+		RENDER_TARGET_BINDING_SLOTS()                               //定义此shader输出绑定RenderTarget
+	END_SHADER_PARAMETER_STRUCT()
+
+以上宏最终用来生成编译期的反射metadata
+const FShaderParametersMetadata* metaData = FParameters::FTypeInfo::GetStructMetadata();
+通过生成这些metadata,向C++提供参数对象的反射能力包括参数名称，类型,shadertype, 结构体内字节偏移,从一个RHI/RDG的void*提取资源必须要具备此种能力，具体参考FShaderParametersMetadata::FMember
+注意这里声明参数时的字节对齐问题，整个结构体按16bytes进行对齐,指针类型一律占据8个字节,为了使结构紧凑，参数的声明顺序是很重要的.否则引擎会插入不必要的padding，增加内存空间占用 
+
+全局UniformBuffer声明采用BEGIN_GLOBAL_SHADER_PARAMETER_STRUCT宏，具体参考SceneRederTargetParameters.h的FSceneTexturesUniformParameters定义,注意还需要一个宏来进行实现定义在SceneRenderTargets.cpp内IMPLEMENT_GLOBAL_SHADER_PARAMETER_STRUCT
+定义后因为在Common.ush内已#include "Engine/Generated/GeneratedUniformBuffers.ush"，在其他的包含Common.ush的shader代码内就可以直接通过以上宏定义的名称(FSceneTexturesUniformParameters是定义了"SceneTexturesStruct")来访问此UniformBuffer
+如果要在一个Shader内定义一个UniformBuffer的引用，需要在BEGIN_SHADER_PARAMETER_STRUCT()宏内通过SHADER_PARAMETER_STRUCT_REF()来定义，注意这里是一个引用形式
+
+在PostProcessing.cpp内的AddSeparateTranslucencyCompositionPass内,通过GraphBuild.AllocParameters为FComposeSeparateTranslucencyPS这个shader的参数FParameters开辟内存空间。
+注意在此shader内声明一个输出参数RenderTarget,为了开辟对应的资源，我们使用GraphBuilder.CreateTexture(SceneColorDesc, TEXT("SceneColor"))来生成一个FRDGTexture资源并返回引用,然后通过PassParameters->RenderTargets[0] = FRenderTargetBinding(NewSceneColor,ERenderTargetLoadAction::ENoAction) 来绑定对应的输出.完成参数定义后，通过TShaderMapRef<FComposeSeparateTranslucencyPS> PixelShader(View.ShaderMap)来生成此shader.
+最后通过FPixelShaderUtils::AddFullscreenPass()将shader添加进RDG中。其内部调用GraphBuilder.AddPass来将shader添加入pipeline,注意此函数需要提供一个lambda表达式作为回调，因为整个RDG的设计思路就是到整帧所有pass都添加完毕后经过优化然后在issue draw command,在最终lambda表达式内的RHI command会被调用向GPU发送各种绘制指令.
+RDGBuilder::Execute()函数在FDeferredShadingSceneRenderer::Render中被调用，其内部迭代所有的pass依次执行pass的Execute,最终调用到lambda内
+
+
+
+
+
+
+
+##Caching与Shader编译
+当修改一个material,Unreal会自动为一个Shader编译所有可能的组合
+FShader::ShouldCompilePermutation,FMaterial, FVertexFactory的ShouldCache函数决定是否生成一个组合,(例如FLensDistortionUVGenerationShader,需要FeatureLevel是SM5)当以上函数返回false时,Unreal不会自动编译对应的组合(FShader, FMaterial, FVertexFactory)，节省了开销
+还有一个方面是在编译HLSL之前,通过ModifyCompilationEnvironment(FShader,FVertexFactory),SetupMaterialEnvironment(FMaterial)可以改变HLSL内的预处理定义,FMaterial大量使用此能力来排除不需要编译的HLSL代码
+
+##向GPU输送顶点数据
+FVertexFactory包装顶点数据源并连接到VertexShader.
+具体的例子比如FLocalVertexFactory,此顶点工厂用来将局部坐标系下顶点转换到世界坐标系,StaticMesh使用此VF.
+VertexFactory与HLSL的绑定通过宏IMPLEMENT_VERTEX_FACTORY_TYPE_EX(参考LocalVertexFactory.cpp内).注意此HLSL绑定无入口函数.观察BasePassVertexShader.usf内的Main入口使用一个FVertexFactoryInput作为参数,此参数定义在LocalVertexFactory.ush和GpuSkinVertexFactory.ush内,根据vertex shader内#include头文件的不同,提供给具体VertexShader的FVertexFactoryInput的定义也是不同的.(这里的#include 会涉及到动态生成,BassPassVertexShader只包含通过引擎处理的生成的后的引用头文件,具体生成机制有待研究)
+
+
+##使用FPrimitiveSceneProxy作为切入点
+一个FPrimitiveScenProxy子类是在RenderThread上的UPrimitiveComponet,负责生成顶点，Push RenderCommand到RenderThread的CommandList中，具体例子可以参考FCableSceneProxy,另外FImagePlateFrustumSceneProxy更加直接,其在回调函数中直接采用PDI接口的DrawLine进行绘制
+
+整体总结来看,IMPLEMENT_MATERIAL_SHADER_TYPE将C++与HLSL代码进行绑定,Vertex Factory决定向shader输送的顶点格式与具体内容,具体shader内使用通用的FVertexFactoryInput结构来描述输入,根据采用的VertexFactory的不同，FVertexFactoryInput结构体的内容也会不同。在FPrimitiveSceneProxy内通过VertexFactory子类的使用来向RenderThread声明自己的顶点格式,然后进行使用
+
+#Drawing Policies
+绘制策略是一个概念的聚合体,引擎通过定义的不同的DrawPolicy来决定采用的shader的具体实现。此绘制策略不会关注绘制什么，何时绘制。
